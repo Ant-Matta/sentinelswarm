@@ -1,4 +1,5 @@
 import numpy as np
+import heapq
 from agents.base_agent import BaseAgent
 from sensors.lidar import LidarSensor
 
@@ -43,8 +44,8 @@ class Scout(BaseAgent):
         super().__init__(position, agent_type="scout")
 
         # Position tracking
-        self.true_position = list(position)       # ground truth position
-        self.believed_position = list(position)   # what Scout thinks its position is
+        self.true_position = list(position)
+        self.believed_position = list(position)
 
         # Energy
         self.max_energy = max_energy
@@ -60,7 +61,7 @@ class Scout(BaseAgent):
         # Sensor
         self.lidar = LidarSensor(max_range=max_range)
 
-        # Observation buffer — queued for transmission to Sentinel
+        # Observation buffer
         self.observation_buffer = []
         self.max_buffer_size = 100
 
@@ -141,16 +142,15 @@ class Scout(BaseAgent):
         dx = tx - cx
         dy = ty - cy
 
-        # Try primary direction first, then secondary
+        if dx == 0 and dy == 0:
+            return False
+
         if abs(dx) >= abs(dy):
             primary = "right" if dx > 0 else "left"
             secondary = "down" if dy > 0 else "up"
         else:
             primary = "down" if dy > 0 else "up"
             secondary = "right" if dx > 0 else "left"
-
-        if dx == 0 and dy == 0:
-            return False
 
         if self.move(primary, environment):
             return True
@@ -159,6 +159,53 @@ class Scout(BaseAgent):
 
         return False
 
+    def find_path(self, target, environment):
+        """
+        A* pathfinding from current position to target.
+        Returns list of (x,y) waypoints, or empty list if no path found.
+        """
+        start = tuple(self.true_position)
+        goal = tuple(target)
+
+        if start == goal:
+            return []
+
+        def heuristic(a, b):
+            return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+        open_set = []
+        heapq.heappush(open_set, (0, start))
+        came_from = {}
+        g_score = {start: 0}
+
+        while open_set:
+            _, current = heapq.heappop(open_set)
+
+            if current == goal:
+                path = []
+                while current in came_from:
+                    path.append(current)
+                    current = came_from[current]
+                path.reverse()
+                return path
+
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = current[0] + dx, current[1] + dy
+                neighbour = (nx, ny)
+
+                if not environment.is_passable(nx, ny):
+                    continue
+
+                tentative_g = g_score[current] + 1
+
+                if tentative_g < g_score.get(neighbour, float('inf')):
+                    came_from[neighbour] = current
+                    g_score[neighbour] = tentative_g
+                    f = tentative_g + heuristic(neighbour, goal)
+                    heapq.heappush(open_set, (f, neighbour))
+
+        return []
+
     # ------------------------------------------------------------------
     # Sensing
     # ------------------------------------------------------------------
@@ -166,7 +213,6 @@ class Scout(BaseAgent):
     def scan(self, environment):
         """
         Perform a LIDAR scan and add observations to buffer.
-
         Returns the list of new observations.
         """
         if self.energy <= self.COST_SCAN:
@@ -178,7 +224,6 @@ class Scout(BaseAgent):
 
         self.energy -= self.COST_SCAN
 
-        # Add to buffer, respecting max size
         for obs in observations:
             if len(self.observation_buffer) < self.max_buffer_size:
                 self.observation_buffer.append(obs)
@@ -218,7 +263,7 @@ class Scout(BaseAgent):
         sx, sy = sentinel_position
         cx, cy = self.true_position
         distance = abs(cx - sx) + abs(cy - sy)
-        return distance * self.COST_MOVE * 1.2  # 20% buffer
+        return distance * self.COST_MOVE * 1.2
 
     def can_return(self, sentinel_position):
         """Check if Scout has enough energy to return safely."""
