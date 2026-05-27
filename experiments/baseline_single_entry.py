@@ -10,6 +10,61 @@ from agents.scout import Scout, BehaviouralState
 from agents.sentinel import Sentinel
 from agents.base_agent import BaseAgent
 
+def print_roll_of_honour(scouts, sentinel, final_metrics):
+    """Print the mission debrief and Roll of Honour to terminal."""
+    width = 48
+    line = "═" * width
+
+    print(f"\n{line}")
+    print(f"{'MISSION DEBRIEF':^{width}}")
+    print(f"{'SentinelSwarm — Environment A':^{width}}")
+    print(line)
+
+    returned = 0
+    lost = 0
+    total_obs = 0
+    total_dist = 0
+
+    for scout in scouts:
+        rec = scout.service_record
+        fate = rec["fate"]
+        sid = scout.id
+
+        if fate == "returned" or fate == "active":
+            returned += 1
+            fate_str = "Returned safely"
+        else:
+            lost += 1
+            fate_str = "Lost in service"
+
+        total_obs += rec["observations_contributed"]
+        total_dist += rec["distance_travelled"]
+
+        print(f"\n  Scout S{sid} — {fate_str}")
+        print(f"    Observations contributed : {rec['observations_contributed']}")
+        print(f"    Distance travelled       : {rec['distance_travelled']} cells")
+
+        if fate == "lost":
+            print(f"    Last known position      : {rec['last_known_position']}")
+            print(f"    Data lost on casualty    : {rec['data_lost_on_casualty']} obs")
+        else:
+            print(f"    Final energy             : {scout.energy_fraction*100:.0f}%")
+
+    print(f"\n{line}")
+    print(f"  Scouts deployed  : {len(scouts)}")
+    print(f"  Returned safely  : {returned}")
+    print(f"  Lost in service  : {lost}")
+    print(f"  Total observations: {total_obs}")
+    print(f"  Total distance   : {total_dist} cells")
+    print(f"\n  Final fidelity   : {final_metrics['fidelity']:.1f}%")
+    print(f"  Final coverage   : {final_metrics['coverage']:.1f}%")
+    print(f"  Mission duration : T:{final_metrics['timestep']}")
+    print(f"\n{line}")
+    print(f"{'They mapped the unknown so we':^{width}}")
+    wouldnt = "wouldn't have to."
+    print(f"{wouldnt:^{width}}")
+    print(f"{line}\n")
+
 
 def main():
     BaseAgent.reset_id_counter()
@@ -64,9 +119,11 @@ def main():
                 "fidelity": sentinel.calculate_fidelity(),
                 "coverage": sentinel.calculate_coverage()
             }
-            print(f"\nMission complete at T:{sentinel.timestep}")
-            print(f"Final fidelity:  {final_metrics['fidelity']:.1f}%")
-            print(f"Final coverage:  {final_metrics['coverage']:.1f}%")
+            # Mark all active scouts as returned
+            for scout in scouts:
+                if scout.active and scout.service_record["fate"] == "active":
+                    scout.mark_returned(sentinel.timestep)
+            print_roll_of_honour(scouts, sentinel, final_metrics)
             continue
 
         # Sentinel step

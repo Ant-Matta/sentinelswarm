@@ -76,6 +76,18 @@ class Scout(BaseAgent):
         self.positions_visited = [tuple(position)]
         self.timestep = 0
 
+        # Service record — for Roll of Honour
+        self.service_record = {
+            "deployed_at": tuple(position),
+            "observations_contributed": 0,
+            "distance_travelled": 0,
+            "fate": "active",               # active, returned, lost
+            "last_known_position": tuple(position),
+            "data_lost_on_casualty": 0,
+            "timestep_deployed": 0,
+            "timestep_end": None,
+        }
+
     # ------------------------------------------------------------------
     # Movement
     # ------------------------------------------------------------------
@@ -124,6 +136,8 @@ class Scout(BaseAgent):
         # Deplete energy
         self.energy -= self.COST_MOVE
         self.positions_visited.append(tuple(self.true_position))
+        self.service_record["distance_travelled"] += 1
+        self.service_record["last_known_position"] = tuple(self.true_position)
         self.timestep += 1
 
         if self.energy <= 0:
@@ -276,8 +290,21 @@ class Scout(BaseAgent):
     def flush_buffer(self):
         """Return and clear the observation buffer."""
         obs = self.observation_buffer.copy()
+        self.service_record["observations_contributed"] += len(obs)
         self.observation_buffer = []
         return obs
+
+    def mark_returned(self, timestep):
+        """Record Scout as returned safely."""
+        self.service_record["fate"] = "returned"
+        self.service_record["timestep_end"] = timestep
+
+    def mark_lost(self, timestep):
+        """Record Scout as lost in service."""
+        self.service_record["fate"] = "lost"
+        self.service_record["timestep_end"] = timestep
+        self.service_record["data_lost_on_casualty"] = len(self.observation_buffer)
+        self.active = False
 
     # ------------------------------------------------------------------
     # Status reporting

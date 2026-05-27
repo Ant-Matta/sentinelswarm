@@ -46,6 +46,7 @@ class Sentinel(BaseAgent):
 
         # Directive log
         self.directives_issued = []
+        self.casualty_log = []
 
     # ------------------------------------------------------------------
     # Initialisation
@@ -275,6 +276,23 @@ class Sentinel(BaseAgent):
                 }
                 reg["current_directive"] = directives[scout.id]
                 continue
+
+            # Check contact loss
+            since_contact = self.timestep - reg["last_contact_timestep"]
+            if since_contact > self.MISSION_LOST_THRESHOLD:
+                if not reg["mission_lost"]:
+                    reg["mission_lost"] = True
+                    scout.mark_lost(self.timestep)
+                    self.casualty_log.append({
+                        "scout_id": scout.id,
+                        "timestep": self.timestep,
+                        "last_known_position": reg["last_known_position"],
+                        "observations_contributed": scout.service_record["observations_contributed"],
+                        "data_lost": scout.service_record["data_lost_on_casualty"],
+                    })
+                continue
+            elif since_contact > self.CONTACT_LOSS_THRESHOLD:
+                reg["contact_lost"] = True
 
             # Check contact loss
             since_contact = self.timestep - reg["last_contact_timestep"]
