@@ -70,26 +70,28 @@ class LidarSensor:
                 # Confidence decreases with distance
                 confidence = max(0.3, 1.0 - (step / self.max_range) * 0.6)
 
+                # Apply surface albedo to confidence
+                albedo = environment.get_albedo(rx, ry)
+                adjusted_confidence = confidence * albedo
+
                 if environment.ground_truth[rx, ry]:
-                    # Ray hit a wall
                     hits.append((rx, ry))
                     obs_key = (rx, ry)
                     if obs_key not in observations:
                         observations[obs_key] = {
                             "cell": (rx, ry),
                             "state": CellState.OCCUPIED,
-                            "confidence": confidence,
+                            "confidence": adjusted_confidence,
                             "distance": measured_distance
                         }
                     break
                 else:
-                    # Ray passed through free space
                     obs_key = (rx, ry)
                     if obs_key not in observations:
                         observations[obs_key] = {
                             "cell": (rx, ry),
                             "state": CellState.FREE,
-                            "confidence": confidence,
+                            "confidence": adjusted_confidence,
                             "distance": measured_distance
                         }
 

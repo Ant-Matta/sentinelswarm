@@ -20,6 +20,10 @@ COLOURS = {
     "panel_border": (60, 60, 60),
     "text":         (200, 200, 200),
     "text_bright":  (255, 255, 255),
+    "rubble":       (139, 100, 60),
+    "basalt":       (60, 60, 80),
+    "thermal":      (255, 80, 0),
+    "thermal_dim":  (100, 40, 0)
 }
 
 SCOUT_COLOURS = [
@@ -80,14 +84,54 @@ class Renderer:
 
     def _draw_ground_truth(self):
         """Render the ground truth environment in the left panel."""
+        from environments.base_environment import TerrainType
+
         for x in range(self.width):
             for y in range(self.height):
                 rect = self._cell_rect(self.left_x, x, y)
+
                 if self.env.ground_truth[x, y]:
                     colour = COLOURS["wall_truth"]
                 else:
-                    colour = COLOURS["free_truth"]
+                    terrain = self.env.terrain[x, y]
+                    if terrain == TerrainType.RUBBLE:
+                        colour = COLOURS["rubble"]
+                    elif terrain == TerrainType.SMOOTH:
+                        colour = COLOURS["basalt"]
+                    elif terrain == TerrainType.THERMAL:
+                        colour = COLOURS["thermal"]
+                    else:
+                        # Show thermal gradient on normal cells
+                        heat = self.env.thermal_field[x, y]
+                        if heat > 0.05:
+                            t = min(heat * 2, 1.0)
+                            colour = self._lerp_colour(
+                                COLOURS["free_truth"],
+                                COLOURS["thermal_dim"],
+                                t
+                            )
+                        else:
+                            colour = COLOURS["free_truth"]
+
                 pygame.draw.rect(self.screen, colour, rect)
+
+        # Entry points
+        for ex, ey in self.env.entry_points:
+            if 0 <= ey < self.height:
+                rect = self._cell_rect(self.left_x, ex, ey)
+                pygame.draw.rect(self.screen, COLOURS["entry"], rect)
+
+        # Sentinel
+        sx, sy = self.env.sentinel_position
+        sent_px = self.left_x + sx * self.cell_px
+        sent_py = self.panels_y + self.panel_h + 2
+        pygame.draw.circle(
+            self.screen, COLOURS["sentinel"],
+            (sent_px + self.cell_px // 2, sent_py + 4), 5
+        )
+
+        label = self.font_md.render("GROUND TRUTH", True, COLOURS["text"])
+        self.screen.blit(label, (self.left_x + 4, self.panels_y + 4))
 
         # Draw entry points
         for ex, ey in self.env.entry_points:

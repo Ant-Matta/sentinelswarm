@@ -128,7 +128,9 @@ class Scout(BaseAgent):
         self.localisation.update(dx, dy)
 
         # Energy and logging
-        self.energy -= self.COST_MOVE
+        # Terrain-aware energy cost
+        terrain_cost = environment.get_traversal_cost(nx, ny)
+        self.energy -= self.COST_MOVE * terrain_cost
         self.positions_visited.append(tuple(self.localisation.true_position))
         self.service_record["distance_travelled"] += 1
         self.service_record["last_known_position"] = tuple(
@@ -232,6 +234,27 @@ class Scout(BaseAgent):
                 self.observation_buffer.append(obs)
 
         return observations
+
+    def scan_thermal(self, environment):
+        """
+        Sample the thermal field at current position.
+        Returns thermal reading 0.0-1.0 and flags anomaly
+        if reading exceeds detection threshold.
+        """
+        x, y = self.localisation.true_position
+        reading = environment.get_thermal_reading(x, y)
+
+        if reading > 0.2:
+            # Detectable thermal gradient
+            anomaly_obs = {
+                "type": "thermal",
+                "position": (x, y),
+                "reading": reading,
+                "confidence": reading
+            }
+            return reading, anomaly_obs
+
+        return reading, None
 
     # ------------------------------------------------------------------
     # Localisation correction
