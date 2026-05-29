@@ -10,14 +10,15 @@ from agents.scout import Scout, BehaviouralState
 from agents.sentinel import Sentinel
 from agents.base_agent import BaseAgent
 
+
 def print_roll_of_honour(scouts, sentinel, final_metrics):
-    """Print the mission debrief and Roll of Honour to terminal."""
     width = 48
     line = "═" * width
 
     print(f"\n{line}")
     print(f"{'MISSION DEBRIEF':^{width}}")
     print(f"{'SentinelSwarm — Environment A':^{width}}")
+    print(f"{'Staggered Deployment Protocol':^{width}}")
     print(line)
 
     returned = 0
@@ -30,7 +31,7 @@ def print_roll_of_honour(scouts, sentinel, final_metrics):
         fate = rec["fate"]
         sid = scout.id
 
-        if fate == "returned" or fate == "active":
+        if fate in ("returned", "active"):
             returned += 1
             fate_str = "Returned safely"
         else:
@@ -41,6 +42,7 @@ def print_roll_of_honour(scouts, sentinel, final_metrics):
         total_dist += rec["distance_travelled"]
 
         print(f"\n  Scout S{sid} — {fate_str}")
+        print(f"    Deployed at              : T:{rec['timestep_deployed']:04d}")
         print(f"    Observations contributed : {rec['observations_contributed']}")
         print(f"    Distance travelled       : {rec['distance_travelled']} cells")
 
@@ -51,17 +53,17 @@ def print_roll_of_honour(scouts, sentinel, final_metrics):
             print(f"    Final energy             : {scout.energy_fraction*100:.0f}%")
 
     print(f"\n{line}")
-    print(f"  Scouts deployed  : {len(scouts)}")
-    print(f"  Returned safely  : {returned}")
-    print(f"  Lost in service  : {lost}")
+    print(f"  Scouts deployed   : {len(scouts)}")
+    print(f"  Returned safely   : {returned}")
+    print(f"  Lost in service   : {lost}")
     print(f"  Total observations: {total_obs}")
-    print(f"  Total distance   : {total_dist} cells")
-    print(f"\n  Final fidelity   : {final_metrics['fidelity']:.1f}%")
-    print(f"  Final coverage   : {final_metrics['coverage']:.1f}%")
-    print(f"  Mission duration : T:{final_metrics['timestep']}")
+    print(f"  Total distance    : {total_dist} cells")
+    print(f"\n  Final fidelity    : {final_metrics['fidelity']:.1f}%")
+    print(f"  Final coverage    : {final_metrics['coverage']:.1f}%")
+    print(f"  Mission duration  : T:{final_metrics['timestep']}")
+    wouldnt = "wouldn't have to."
     print(f"\n{line}")
     print(f"{'They mapped the unknown so we':^{width}}")
-    wouldnt = "wouldn't have to."
     print(f"{wouldnt:^{width}}")
     print(f"{line}\n")
 
@@ -74,24 +76,29 @@ def main():
     clock = pygame.time.Clock()
 
     sentinel = Sentinel(position=env.sentinel_position, environment=env)
-
-    # Disable decay for Phase 1 — static environment doesn't need it
     sentinel.DECAY_RATE = 1.0
 
     entry = env.entry_points[0]
-    scouts = [
+
+    # Create all Scouts — they start queued, not deployed
+    all_scouts = [
         Scout(position=entry, max_energy=500, seed=i)
         for i in range(3)
     ]
 
-    for scout in scouts:
-        sentinel.register_scout(scout)
+    # Queue all Scouts with Sentinel — it decides when to deploy
+    for scout in all_scouts:
+        sentinel.queue_scout(scout)
 
-    scout_paths = {s.id: [] for s in scouts}
+    # Tracking
+    deployed_scouts = []        # actively on mission
+    scout_paths = {}            # A* paths per Scout
 
-    print("SentinelSwarm — mission started.")
+    print("SentinelSwarm — staggered deployment protocol active.")
     print(f"Environment: {env}")
-    print("Press ESC to exit.")
+    print(f"3 Scouts queued. Sentinel will deploy on its schedule.")
+    print(f"Deployment gap: {sentinel.DEPLOYMENT_GAP} timesteps")
+    print("Press ESC to exit.\n")
 
     running = True
     mission_complete = False
@@ -101,35 +108,44 @@ def main():
         running = renderer.handle_events()
 
         if mission_complete:
-            # Hold final frame — mission is done
             renderer.render(sentinel.world_model, [], final_metrics)
             clock.tick(10)
             continue
 
-        # Check termination — all Scouts dead or returned with no energy
-        all_inactive = all(
-            not s.active or s.energy_critical
-            for s in scouts
-        )
+        # --- Sentinel deployment decision ---
+        if sentinel.should_deploy_next():
+            new_scout = sentinel.deploy_next_scout()
+            if new_scout:
+                new_scout.service_record["timestep_deployed"] = sentinel.timestep
+                new_scout.state = BehaviouralState.EXPLORING
+                deployed_scouts.append(new_scout)
+                scout_paths[new_scout.id] = []
 
-        if all_inactive:
-            mission_complete = True
-            final_metrics = {
-                "timestep": sentinel.timestep,
-                "fidelity": sentinel.calculate_fidelity(),
-                "coverage": sentinel.calculate_coverage()
-            }
-            # Mark all active scouts as returned
-            for scout in scouts:
-                if scout.active and scout.service_record["fate"] == "active":
-                    scout.mark_returned(sentinel.timestep)
-            print_roll_of_honour(scouts, sentinel, final_metrics)
-            continue
+        # --- Termination check ---
+        if deployed_scouts:
+            all_inactive = all(
+                not s.active or s.energy_critical
+                for s in deployed_scouts
+            ) and not sentinel.deployment_queue
 
-        # Sentinel step
-        directives = sentinel.step(scouts)
+            if all_inactive:
+                mission_complete = True
+                final_metrics = {
+                    "timestep": sentinel.timestep,
+                    "fidelity": sentinel.calculate_fidelity(),
+                    "coverage": sentinel.calculate_coverage()
+                }
+                for scout in deployed_scouts:
+                    if scout.active and scout.service_record["fate"] == "active":
+                        scout.mark_returned(sentinel.timestep)
+                print_roll_of_honour(all_scouts, sentinel, final_metrics)
+                continue
 
-        for scout in scouts:
+        # --- Sentinel step ---
+        sentinel.step(deployed_scouts)
+
+        # --- Scout behaviour ---
+        for scout in deployed_scouts:
             if not scout.active:
                 continue
 
@@ -139,21 +155,43 @@ def main():
                 scout.target_position = entry
                 scout_paths[scout.id] = scout.find_path(entry, env)
 
-            # Apply Sentinel directive if not already returning
-            elif scout.state != BehaviouralState.RETURNING:
-                directive = directives.get(scout.id)
-                if directive:
-                    new_target = directive["target"]
-                    if new_target != scout.target_position:
-                        scout.target_position = new_target
-                        scout_paths[scout.id] = scout.find_path(new_target, env)
-                    if directive["type"] == "RETURN":
-                        scout.state = BehaviouralState.RETURNING
-                    else:
-                        scout.state = BehaviouralState.EXPLORING
+            # Assign new target if needed
+            elif scout.state != BehaviouralState.RETURNING and not scout.target_position:
+                other_ids = [
+                    s.id for s in deployed_scouts
+                    if s.id != scout.id and s.active
+                ]
+
+                # Clustering check
+                clustered = any(
+                    sentinel.scouts_are_clustered(scout.id, oid)
+                    for oid in other_ids
+                )
+
+                if clustered:
+                    target = sentinel.get_dispersal_target(scout.id, other_ids)
+                else:
+                    # Pick best unclaimed frontier
+                    exclude = {
+                        tuple(s.target_position)
+                        for s in deployed_scouts
+                        if s.target_position and s.id != scout.id
+                    }
+                    frontiers = sentinel.get_frontiers()
+                    target = None
+                    for _, pos in frontiers:
+                        if pos not in exclude:
+                            target = pos
+                            break
+
+                if target:
+                    scout.target_position = target
+                    scout_paths[scout.id] = scout.find_path(target, env)
+                    scout.state = BehaviouralState.EXPLORING
+                    sentinel.claimed_frontiers[scout.id] = target
 
             # Follow path
-            path = scout_paths[scout.id]
+            path = scout_paths.get(scout.id, [])
             if path:
                 next_step = path[0]
                 scout.move_toward(next_step, env)
@@ -165,23 +203,41 @@ def main():
             # Scan
             scout.scan(env)
 
-            # Recharge and reset at entry
+            # Recharge at entry
             if tuple(scout.true_position) == entry:
                 scout.energy = scout.max_energy
                 scout.state = BehaviouralState.IDLE
-                scout.correct_drift(entry)
+                scout.correct_at_reference(entry)
+                scout.target_position = None
+                scout_paths[scout.id] = []
+                sentinel.clear_claimed_frontier(scout.id)
+
+            # Clear target when reached
+            elif scout.target_position and \
+                    tuple(scout.true_position) == tuple(scout.target_position):
+                sentinel.clear_claimed_frontier(scout.id)
                 scout.target_position = None
                 scout_paths[scout.id] = []
 
+        # --- Render ---
         scout_states = [
             {
                 "id": s.id,
                 "position": tuple(s.true_position),
                 "energy": s.energy_fraction
             }
-            for s in scouts
+            for s in deployed_scouts
             if s.active
         ]
+
+        # Show queued Scouts as waiting at entry
+        for s in all_scouts:
+            if s not in deployed_scouts:
+                scout_states.append({
+                    "id": s.id,
+                    "position": entry,
+                    "energy": 1.0
+                })
 
         metrics = {
             "timestep": sentinel.timestep,
@@ -193,9 +249,6 @@ def main():
         clock.tick(30)
 
     renderer.close()
-
-    if final_metrics:
-        print("\nFinal results logged. Close window to exit.")
 
 
 if __name__ == "__main__":

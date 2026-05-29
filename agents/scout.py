@@ -2,6 +2,7 @@ import numpy as np
 import heapq
 from agents.base_agent import BaseAgent
 from sensors.lidar import LidarSensor
+from sensors.localisation import LocalisationModule
 
 
 class BehaviouralState:
@@ -20,18 +21,14 @@ class Scout(BaseAgent):
     Enters the unknown environment, conducts local LIDAR sensing,
     relays observations back toward the Sentinel.
 
-    The Scout does not maintain a global map. It holds only:
-    - Its current believed position (with drift)
-    - A local observation buffer (queued for transmission)
-    - Its current energy level
-    - Its current behavioural state
+    Position estimation is fully delegated to LocalisationModule,
+    keeping movement logic clean and the localisation stack swappable.
     """
 
-    # Energy costs per action
     COST_MOVE = 1.0
     COST_SCAN = 0.5
     COST_TRANSMIT = 2.0
-    SAFETY_MARGIN = 0.15      # fraction of max energy kept in reserve
+    SAFETY_MARGIN = 0.15
 
     def __init__(
         self,
@@ -43,20 +40,16 @@ class Scout(BaseAgent):
     ):
         super().__init__(position, agent_type="scout")
 
-        # Position tracking
-        self.true_position = list(position)
-        self.believed_position = list(position)
+        # Localisation — fully delegated
+        self.localisation = LocalisationModule(
+            initial_position=position,
+            drift_rate=drift_rate,
+            seed=seed
+        )
 
         # Energy
         self.max_energy = max_energy
         self.energy = max_energy
-
-        # Localisation drift
-        self.drift_rate = drift_rate
-        self.cumulative_drift = [0.0, 0.0]
-
-        # Random state
-        self.rng = np.random.default_rng(seed)
 
         # Sensor
         self.lidar = LidarSensor(max_range=max_range)
@@ -68,7 +61,7 @@ class Scout(BaseAgent):
         # Behavioural state
         self.state = BehaviouralState.IDLE
 
-        # Current directive from Sentinel
+        # Current directive
         self.current_directive = None
         self.target_position = None
 
@@ -76,12 +69,12 @@ class Scout(BaseAgent):
         self.positions_visited = [tuple(position)]
         self.timestep = 0
 
-        # Service record — for Roll of Honour
+        # Service record
         self.service_record = {
             "deployed_at": tuple(position),
             "observations_contributed": 0,
             "distance_travelled": 0,
-            "fate": "active",               # active, returned, lost
+            "fate": "active",
             "last_known_position": tuple(position),
             "data_lost_on_casualty": 0,
             "timestep_deployed": 0,
@@ -89,55 +82,58 @@ class Scout(BaseAgent):
         }
 
     # ------------------------------------------------------------------
+    # Position properties — delegate to localisation
+    # ------------------------------------------------------------------
+
+    @property
+    def true_position(self):
+        return self.localisation.true_position
+
+    @property
+    def believed_position(self):
+        return self.localisation.believed_position
+
+    @property
+    def position_confidence(self):
+        return self.localisation.position_confidence
+
+    # ------------------------------------------------------------------
     # Movement
     # ------------------------------------------------------------------
+
+    DIRECTION_DELTAS = {
+        "up":    (0, -1),
+        "down":  (0,  1),
+        "left":  (-1, 0),
+        "right": (1,  0),
+    }
 
     def move(self, direction, environment):
         """
         Attempt to move one cell in the given direction.
-
-        Args:
-            direction: one of "up", "down", "left", "right"
-            environment: BaseEnvironment instance
-
-        Returns:
-            True if move succeeded, False if blocked
+        Returns True if move succeeded, False if blocked.
         """
         if self.energy <= 0:
             self.active = False
             return False
 
-        dx, dy = {
-            "up":    (0, -1),
-            "down":  (0,  1),
-            "left":  (-1, 0),
-            "right": (1,  0),
-        }.get(direction, (0, 0))
-
-        nx = self.true_position[0] + dx
-        ny = self.true_position[1] + dy
+        dx, dy = self.DIRECTION_DELTAS.get(direction, (0, 0))
+        nx = self.localisation.x + dx
+        ny = self.localisation.y + dy
 
         if not environment.is_passable(nx, ny):
             return False
 
-        # Update true position
-        self.true_position[0] = nx
-        self.true_position[1] = ny
+        # Delegate position update to localisation module
+        self.localisation.update(dx, dy)
 
-        # Update believed position with drift
-        drift_x = self.rng.normal(0, self.drift_rate)
-        drift_y = self.rng.normal(0, self.drift_rate)
-        self.cumulative_drift[0] += drift_x
-        self.cumulative_drift[1] += drift_y
-
-        self.believed_position[0] = self.true_position[0] + self.cumulative_drift[0]
-        self.believed_position[1] = self.true_position[1] + self.cumulative_drift[1]
-
-        # Deplete energy
+        # Energy and logging
         self.energy -= self.COST_MOVE
-        self.positions_visited.append(tuple(self.true_position))
+        self.positions_visited.append(tuple(self.localisation.true_position))
         self.service_record["distance_travelled"] += 1
-        self.service_record["last_known_position"] = tuple(self.true_position)
+        self.service_record["last_known_position"] = tuple(
+            self.localisation.true_position
+        )
         self.timestep += 1
 
         if self.energy <= 0:
@@ -146,12 +142,9 @@ class Scout(BaseAgent):
         return True
 
     def move_toward(self, target, environment):
-        """
-        Move one step toward target position using simple
-        axis-aligned movement. Returns True if moved.
-        """
+        """Move one step toward target using axis-aligned movement."""
         tx, ty = target
-        cx, cy = self.true_position
+        cx, cy = self.localisation.true_position
 
         dx = tx - cx
         dy = ty - cy
@@ -174,11 +167,8 @@ class Scout(BaseAgent):
         return False
 
     def find_path(self, target, environment):
-        """
-        A* pathfinding from current position to target.
-        Returns list of (x,y) waypoints, or empty list if no path found.
-        """
-        start = tuple(self.true_position)
+        """A* pathfinding to target. Returns waypoint list."""
+        start = tuple(self.localisation.true_position)
         goal = tuple(target)
 
         if start == goal:
@@ -203,8 +193,8 @@ class Scout(BaseAgent):
                 path.reverse()
                 return path
 
-            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                nx, ny = current[0] + dx, current[1] + dy
+            for ddx, ddy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = current[0] + ddx, current[1] + ddy
                 neighbour = (nx, ny)
 
                 if not environment.is_passable(nx, ny):
@@ -225,15 +215,14 @@ class Scout(BaseAgent):
     # ------------------------------------------------------------------
 
     def scan(self, environment):
-        """
-        Perform a LIDAR scan and add observations to buffer.
-        Returns the list of new observations.
-        """
+        """Perform LIDAR scan and buffer observations."""
         if self.energy <= self.COST_SCAN:
             return []
 
         observations, _ = self.lidar.scan(
-            tuple(self.true_position), environment, self.rng
+            tuple(self.localisation.true_position),
+            environment,
+            self.localisation.rng
         )
 
         self.energy -= self.COST_SCAN
@@ -248,14 +237,15 @@ class Scout(BaseAgent):
     # Localisation correction
     # ------------------------------------------------------------------
 
-    def correct_drift(self, reference_position):
-        """
-        Snap believed position to a known reference point.
-        Called when Scout passes through a known location.
-        """
-        self.believed_position[0] = float(reference_position[0])
-        self.believed_position[1] = float(reference_position[1])
-        self.cumulative_drift = [0.0, 0.0]
+    def correct_at_reference(self, known_position):
+        """Delegate drift correction to localisation module."""
+        self.localisation.correct_at_reference(known_position)
+
+    def get_range_to(self, other_scout):
+        """Estimate distance to another Scout via localisation module."""
+        return self.localisation.get_range_to(
+            other_scout.believed_position
+        )
 
     # ------------------------------------------------------------------
     # Energy
@@ -270,17 +260,12 @@ class Scout(BaseAgent):
         return self.energy_fraction <= self.SAFETY_MARGIN
 
     def estimated_return_cost(self, sentinel_position):
-        """
-        Estimate energy needed to return to Sentinel.
-        Uses Manhattan distance as approximation.
-        """
         sx, sy = sentinel_position
-        cx, cy = self.true_position
+        cx, cy = self.localisation.true_position
         distance = abs(cx - sx) + abs(cy - sy)
         return distance * self.COST_MOVE * 1.2
 
     def can_return(self, sentinel_position):
-        """Check if Scout has enough energy to return safely."""
         return self.energy > self.estimated_return_cost(sentinel_position)
 
     # ------------------------------------------------------------------
@@ -288,22 +273,26 @@ class Scout(BaseAgent):
     # ------------------------------------------------------------------
 
     def flush_buffer(self):
-        """Return and clear the observation buffer."""
+        """Return and clear observation buffer."""
         obs = self.observation_buffer.copy()
         self.service_record["observations_contributed"] += len(obs)
         self.observation_buffer = []
         return obs
 
+    # ------------------------------------------------------------------
+    # Service record
+    # ------------------------------------------------------------------
+
     def mark_returned(self, timestep):
-        """Record Scout as returned safely."""
         self.service_record["fate"] = "returned"
         self.service_record["timestep_end"] = timestep
 
     def mark_lost(self, timestep):
-        """Record Scout as lost in service."""
         self.service_record["fate"] = "lost"
         self.service_record["timestep_end"] = timestep
-        self.service_record["data_lost_on_casualty"] = len(self.observation_buffer)
+        self.service_record["data_lost_on_casualty"] = len(
+            self.observation_buffer
+        )
         self.active = False
 
     # ------------------------------------------------------------------
@@ -311,11 +300,15 @@ class Scout(BaseAgent):
     # ------------------------------------------------------------------
 
     def get_status(self):
-        """Return current Scout status as a dict."""
+        """Return full Scout status for Sentinel registry update."""
+        loc = self.localisation.get_status()
         return {
             "id": self.id,
-            "position": tuple(self.true_position),
-            "believed_position": tuple(self.believed_position),
+            "position": loc["true_position"],
+            "believed_position": loc["believed_position"],
+            "position_confidence": loc["position_confidence"],
+            "drift_magnitude": loc["drift_magnitude"],
+            "steps_since_correction": loc["steps_since_correction"],
             "energy": self.energy,
             "energy_fraction": self.energy_fraction,
             "energy_critical": self.energy_critical,
@@ -327,7 +320,9 @@ class Scout(BaseAgent):
 
     def __repr__(self):
         return (
-            f"Scout(id={self.id}, pos={self.true_position}, "
-            f"energy={self.energy:.1f}/{self.max_energy}, "
-            f"state={self.state}, active={self.active})"
+            f"Scout(id={self.id}, "
+            f"pos={tuple(self.localisation.true_position)}, "
+            f"conf={self.position_confidence:.2f}, "
+            f"energy={self.energy:.0f}/{self.max_energy}, "
+            f"state={self.state})"
         )

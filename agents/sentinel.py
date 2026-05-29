@@ -26,6 +26,8 @@ class Sentinel(BaseAgent):
     CONTRADICTION_PENALTY = 0.7    # confidence multiplier on contradiction
     DECAY_RATE = 0.997             # confidence decay per timestep
     MAX_BUFFER_PROCESS = 20        # max observations processed per Scout per cycle
+    DEPLOYMENT_GAP = 40            # timesteps between Scout deployments
+    MIN_FRONTIERS_TO_DEPLOY = 15   # minimum new frontiers before deploying next Scout
 
     def __init__(self, position, environment):
         super().__init__(position, agent_type="sentinel")
@@ -47,6 +49,12 @@ class Sentinel(BaseAgent):
         # Directive log
         self.directives_issued = []
         self.casualty_log = []
+
+        # Deployment queue
+        self.deployment_queue = []      # Scouts waiting to be deployed
+        self.deployed_scouts = []       # Scouts currently on mission
+        self.last_deployment_time = -1  # timestep of last deployment
+        self.deployment_count = 0       # how many Scouts have been deployed
 
     # ------------------------------------------------------------------
     # Initialisation
@@ -73,6 +81,9 @@ class Sentinel(BaseAgent):
         self.scout_registry[scout.id] = {
             "id": scout.id,
             "last_known_position": tuple(scout.true_position),
+            "believed_position": tuple(scout.believed_position),
+            "position_confidence": 1.0,
+            "drift_magnitude": 0.0,
             "last_contact_timestep": self.timestep,
             "energy_level": scout.energy_fraction,
             "state": scout.state,
@@ -81,16 +92,159 @@ class Sentinel(BaseAgent):
             "mission_lost": False,
         }
 
+    def queue_scout(self, scout):
+        """
+        Add a Scout to the deployment queue.
+        Scouts wait here until the Sentinel decides to deploy them.
+        """
+        self.deployment_queue.append(scout)
+
+    def should_deploy_next(self):
+        """
+        Sentinel decision: is it time to deploy the next Scout?
+
+        Conditions:
+        1. There are Scouts waiting in the queue
+        2. Enough time has passed since last deployment
+        3. The world model has enough new frontier data to give
+           the next Scout a meaningfully different assignment
+        4. At least one deployed Scout is healthy and transmitting
+
+        Returns True if deployment should proceed.
+        """
+        if not self.deployment_queue:
+            return False
+
+        # Always deploy first Scout immediately
+        if self.deployment_count == 0:
+            return True
+
+        # Time gap condition
+        time_since_last = self.timestep - self.last_deployment_time
+        if time_since_last < self.DEPLOYMENT_GAP:
+            return False
+
+        # Frontier condition — enough unexplored space to justify new Scout
+        frontiers = self.get_frontiers()
+        if len(frontiers) < self.MIN_FRONTIERS_TO_DEPLOY:
+            return False
+
+        # Health condition — at least one active Scout reporting in
+        active_reporting = [
+            reg for reg in self.scout_registry.values()
+            if not reg["contact_lost"] and not reg["mission_lost"]
+        ]
+        if self.deployment_count > 0 and not active_reporting:
+            return False
+
+        return True
+
+    def deploy_next_scout(self):
+        """
+        Deploy the next Scout from the queue.
+        Returns the deployed Scout, or None if queue is empty.
+        """
+        if not self.deployment_queue:
+            return None
+
+        scout = self.deployment_queue.pop(0)
+        self.deployed_scouts.append(scout)
+        self.register_scout(scout)
+        self.last_deployment_time = self.timestep
+        self.deployment_count += 1
+
+        print(
+            f"  [T:{self.timestep:04d}] Sentinel deploys Scout S{scout.id} "
+            f"— {len(self.deployment_queue)} remaining in queue"
+        )
+
+        return scout
+
     def update_scout_status(self, scout_id, status):
         """Update registry from a Scout status report."""
         if scout_id not in self.scout_registry:
             return
         reg = self.scout_registry[scout_id]
         reg["last_known_position"] = status["position"]
+        reg["believed_position"] = status["believed_position"]
+        reg["position_confidence"] = status["position_confidence"]
+        reg["drift_magnitude"] = status["drift_magnitude"]
         reg["last_contact_timestep"] = self.timestep
         reg["energy_level"] = status["energy_fraction"]
         reg["state"] = status["state"]
         reg["contact_lost"] = False
+
+    def clear_claimed_frontier(self, scout_id):
+        """Release a Scout's claimed frontier when reached or reassigned."""
+        if scout_id in self.claimed_frontiers:
+            del self.claimed_frontiers[scout_id]
+
+    def scouts_are_clustered(self, scout_a_id, scout_b_id, threshold=10):
+        """
+        Determine whether two Scouts are clustered too closely.
+
+        Only trusted when both Scouts have high position confidence.
+        Avoids false positives from drift-induced position errors.
+        """
+        reg_a = self.scout_registry.get(scout_a_id)
+        reg_b = self.scout_registry.get(scout_b_id)
+
+        if not reg_a or not reg_b:
+            return False
+
+        # Don't trust clustering detection if positions are uncertain
+        combined_confidence = min(
+            reg_a["position_confidence"],
+            reg_b["position_confidence"]
+        )
+        if combined_confidence < 0.5:
+            return False
+
+        ax, ay = reg_a["last_known_position"]
+        bx, by = reg_b["last_known_position"]
+        distance = abs(ax - bx) + abs(ay - by)
+
+        return distance < threshold
+
+    def get_dispersal_target(self, scout_id, other_scout_ids):
+        """
+        Find a frontier target that maximises distance from other Scouts.
+        Used when clustering is detected — no environmental prior needed.
+        """
+        reg = self.scout_registry.get(scout_id)
+        if not reg:
+            return None
+
+        other_positions = [
+            self.scout_registry[sid]["last_known_position"]
+            for sid in other_scout_ids
+            if sid in self.scout_registry and sid != scout_id
+        ]
+
+        frontiers = self.get_frontiers()
+        best_score = -1
+        best_pos = None
+
+        claimed = set(self.claimed_frontiers.values())
+
+        for _, pos in frontiers:
+            if pos in claimed:
+                continue
+
+            if not other_positions:
+                return pos
+
+            # Score by minimum distance from all other Scouts
+            min_dist = min(
+                abs(pos[0] - ox) + abs(pos[1] - oy)
+                for ox, oy in other_positions
+            )
+
+            if min_dist > best_score:
+                best_score = min_dist
+                best_pos = pos
+
+        return best_pos    
 
     # ------------------------------------------------------------------
     # Map fusion
@@ -185,6 +339,13 @@ class Sentinel(BaseAgent):
         frontiers = []
         claimed = set(self.claimed_frontiers.values())
 
+        # Current Scout positions for isolation scoring
+        scout_positions = [
+            reg["last_known_position"]
+            for reg in self.scout_registry.values()
+            if not reg["mission_lost"] and not reg["contact_lost"]
+        ]
+
         for x in range(self.environment.width):
             for y in range(self.environment.height):
                 cell = self.world_model[(x, y)]
@@ -221,28 +382,39 @@ class Sentinel(BaseAgent):
                 if not has_known_neighbour and cell["state"] != CellState.UNKNOWN:
                     continue
 
-                score = self._frontier_score(x, y, cell, unknown_neighbours)
+                score = self._frontier_score(x, y, cell, unknown_neighbours, scout_positions)
                 frontiers.append((score, (x, y)))
 
         frontiers.sort(reverse=True)
         return frontiers
 
-    def _frontier_score(self, x, y, cell, unknown_neighbours):
-        """Score a frontier cell for exploration priority."""
+    def _frontier_score(self, x, y, cell, unknown_neighbours, scout_positions=None):
+        """
+        Score a frontier cell for exploration priority.
+
+        Weights:
+        - Uncertainty value: how unknown is this cell
+        - Adjacency bonus: how much unknown space lies beyond it
+        - Isolation bonus: how far is it from current Scout positions
+        """
         uncertainty_value = 1.0 - cell["confidence"]
         adjacency_bonus = unknown_neighbours / 8.0
 
-        # Distance from environment centre (prefer central exploration)
-        cx = self.environment.width / 2
-        cy = self.environment.height / 2
-        dist_from_centre = np.sqrt((x - cx)**2 + (y - cy)**2)
-        max_dist = np.sqrt(cx**2 + cy**2)
-        centrality = 1.0 - (dist_from_centre / max_dist)
+        # Isolation bonus — prefer cells far from current Scout positions
+        if scout_positions and len(scout_positions) > 0:
+            min_dist = min(
+                abs(x - sx) + abs(y - sy)
+                for sx, sy in scout_positions
+            )
+            max_possible = self.environment.width + self.environment.height
+            isolation = min(min_dist / max_possible, 1.0)
+        else:
+            isolation = 0.5
 
         return (
             0.5 * uncertainty_value +
             0.3 * adjacency_bonus +
-            0.2 * centrality
+            0.2 * isolation
         )
 
     # ------------------------------------------------------------------
@@ -410,25 +582,25 @@ class Sentinel(BaseAgent):
     # Step
     # ------------------------------------------------------------------
 
-    def step(self, scouts):
+    def step(self, deployed_scouts):
         """
         Advance Sentinel by one timestep.
-        Collects observations, applies decay, runs decision cycle.
+
+        Only processes Scouts that have been formally deployed.
+        Queued Scouts are held at entry until deployment conditions met.
         """
         self.timestep += 1
         self.apply_confidence_decay()
 
-        # Collect observations from all active Scouts
-        for scout in scouts:
+        # Collect observations from deployed Scouts only
+        for scout in deployed_scouts:
             if not scout.active:
                 continue
             if scout.id not in self.scout_registry:
                 self.register_scout(scout)
 
-            # Update registry
             self.update_scout_status(scout.id, scout.get_status())
 
-            # Fuse observations
             obs = scout.flush_buffer()
             if obs:
                 self.fuse_observations(scout.id, obs)
@@ -436,7 +608,7 @@ class Sentinel(BaseAgent):
         # Run decision cycle periodically
         directives = {}
         if self.timestep % self.DECISION_INTERVAL == 0:
-            directives = self.run_decision_cycle(scouts)
+            directives = self.run_decision_cycle(deployed_scouts)
 
         return directives
 
